@@ -1,5 +1,6 @@
 *.md
 .*
+.csv
 
 !README.md
 !.gitignore
