@@ -121,6 +121,52 @@ services:
       start_period: 30s
     restart: always
 
+  # MySQL service used as the Data Warehouse for this workshop.
+  # Credentials are interpolated from the .env file that sits next to this
+  # compose file. The same .env is read by src/config.py so both the local
+  # pipeline and the container use the same source of truth.
+  mysql-dw:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      # MYSQL_DATABASE only creates ONE database. We use it for the
+      # source/landing DB; the warehouse DB is created by init_dw.sh.
+      MYSQL_DATABASE: ${MYSQL_SRC_DB}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      # Exposed so init_dw.sh (sourced by the entrypoint) can expand it.
+      MYSQL_DW_DB: ${MYSQL_DW_DB}
+    ports:
+      # Host 3307 -> container 3306. The host port is shifted to avoid
+      # colliding with a native MySQL/MariaDB already listening on 3306.
+      # Inside the docker network other services still reach it at mysql-dw:3306.
+      - "3307:3306"
+    volumes:
+      - mysql-dw-volume:/var/lib/mysql
+      # Init scripts are consumed alphabetically by the official mysql
+      # entrypoint. 01 seeds the source DB, 02 creates the warehouse DB
+      # and grants the app user, 03 builds the empty star schema.
+      - ../sql/init_db_grammys.sql:/docker-entrypoint-initdb.d/01_init_db_grammys.sql:ro
+      - ../sql/init_dw.sh:/docker-entrypoint-initdb.d/02_init_dw.sh:ro
+      - ../sql/create_star_schema.sql:/docker-entrypoint-initdb.d/03_create_star_schema.sql:ro
+      # Seed CSV is mounted at /seed (anywhere outside the directories that
+      # the MySQL 8 entrypoint chowns at boot: $DATADIR, socket dir, and
+      # whatever secure-file-priv points at). Because we start mysqld with
+      # an EMPTY secure-file-priv (see `command:` below), the entrypoint's
+      # chown loop skips it and our read-only bind mount survives.
+      - ./data/the_grammy_awards.csv:/seed/the_grammy_awards.csv:ro
+    # secure-file-priv= (empty) means "LOAD DATA INFILE allowed from any
+    # path". Required so the init script can read /seed/... without
+    # putting /seed under the entrypoint's chown scope.
+    command: --secure-file-priv= --local-infile=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: always
+
   airflow-apiserver:
     <<: *airflow-common
     command: api-server
@@ -337,3 +383,4 @@ services:
 
 volumes:
   postgres-db-volume:
+  mysql-dw-volume:
