@@ -10,6 +10,11 @@
 !.env.example
 /airflow/config/*.json
 
+# --- Pipeline staging artifacts ---
+*.pkl
+airflow/config/airflow.cfg
+airflow/logs/
+
 # --- Python ---
 __pycache__/
 *.py[cod]
