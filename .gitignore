@@ -8,3 +8,24 @@
 !.gitignore
 !.gitkeep
 /airflow/config/*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+# Entornos virtuales
+venv/
+.venv/
+env/
+.env
+
+*.log
+*.sql.gz
+
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+.DS_Store
+Thumbs.db
