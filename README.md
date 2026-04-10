@@ -61,11 +61,13 @@ data, the warehouse is the curated model that downstream BI tools query.
 ```
 etl-workshop_2/
 ├── airflow/
-│   ├── docker-compose.yaml       # Airflow + mysql-dw (Phase A uses only mysql-dw)
-│   ├── requirements.txt          # Runtime deps for Airflow workers (Phase B)
+│   ├── docker-compose.yaml       # Airflow + mysql-dw, mounts src/ and requirements.txt
+│   ├── requirements.txt          # Runtime deps installed in every Airflow container
 │   ├── .env                      # gitignored — real credentials
 │   ├── .env.example              # template checked into the repo
-│   ├── config/                   # gitignored — google_oauth_client.json, token
+│   ├── config/                   # gitignored — airflow.cfg, OAuth JSONs
+│   ├── dags/
+│   │   └── etl_spotify_grammys.py  # DAG: 7 tasks wrapping src/ functions
 │   └── data/
 │       ├── spotify_dataset.csv
 │       └── the_grammy_awards.csv
@@ -482,7 +484,133 @@ GROUP BY a.artist_name ORDER BY avg_pop DESC LIMIT 10;
 
 ---
 
-## 10. Assumptions and decisions
+## 10. Phase B — Airflow adaptation
+
+Phase B wraps every function from `src/` in an Airflow DAG without
+duplicating a single line of business logic. The DAG lives at
+`airflow/dags/etl_spotify_grammys.py`.
+
+### 10.1 How the DAG reaches `src/`
+
+A read-only volume mount in `docker-compose.yaml` maps the host's `src/`
+directory into every Airflow container:
+
+```yaml
+# inside x-airflow-common.volumes
+- ${AIRFLOW_PROJ_DIR:-.}/../src:/opt/airflow/src:ro
+```
+
+The DAG file adds this path at import time:
+
+```python
+sys.path.insert(0, "/opt/airflow/src")
+```
+
+This avoids `PYTHONPATH` env vars, `pip install -e .`, or any packaging
+infrastructure. The trade-off is that the DAG file has a hard-coded
+container path, but since the compose file controls the mount, the two
+are always in sync.
+
+### 10.2 DAG structure
+
+```
+extract_spotify ──► clean_spotify_task ──┐
+                                         ├──► merge_task ──┬──► load_dw_task
+extract_grammys ──► clean_grammys_task ──┘                 └──► upload_drive_task
+```
+
+- **7 tasks**, each a `@task`-decorated function (TaskFlow API).
+- The two extractions run in **parallel**.
+- Both loads (`load_dw_task` and `upload_drive_task`) depend on
+  `merge_task` but are **independent of each other**.
+- `schedule=None` — the DAG is triggered manually (no cron).
+
+### 10.3 Staging with pickle files
+
+Tasks exchange DataFrames through pickle files in `/opt/airflow/data/`
+(which maps to `airflow/data/` on the host). Each task reads its
+upstream's pickle and writes its own:
+
+| Task | Reads | Writes |
+|------|-------|--------|
+| `extract_spotify` | `spotify_dataset.csv` | `_stage_spotify_raw.pkl` |
+| `extract_grammys` | MySQL `grammys_src.awards` | `_stage_grammys_raw.pkl` |
+| `clean_spotify_task` | `_stage_spotify_raw.pkl` | `_stage_spotify_clean.pkl` |
+| `clean_grammys_task` | `_stage_grammys_raw.pkl` | `_stage_grammys_clean.pkl` |
+| `merge_task` | both `_stage_*_clean.pkl` | `_stage_merged.pkl` |
+| `load_dw_task` | `_stage_merged.pkl` | MySQL `grammys_dw.*` |
+| `upload_drive_task` | `_stage_merged.pkl` | Google Drive CSV |
+
+**Why pickle instead of CSV?** Pickle preserves DataFrame dtypes
+exactly (booleans, tz-aware datetimes, nullable integers) so downstream
+tasks receive the same object the upstream wrote — no re-parsing, no
+type inference, no `parse_dates=` arguments. It is also ~10x faster to
+read/write than CSV for this dataset size. The trade-off is that pickles
+are not human-readable and are tied to the pandas version, but since
+they are ephemeral staging artifacts (regenerated on every run and
+gitignored), neither limitation matters.
+
+### 10.4 Credentials inside the containers
+
+The DAG reads MySQL credentials from **environment variables**
+(`MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_SRC_DB`, `MYSQL_DW_DB`) that
+the compose file injects via `env_file: .env`. No secrets are
+hard-coded in the DAG file. The MySQL hostname inside the Docker network
+is `mysql-dw` on port `3306` (not `localhost:3307` like on the host).
+
+Google Drive credentials live in `airflow/config/`, which is mounted at
+`/opt/airflow/config/`. The OAuth token persisted during Phase A's
+first run is reused by the Airflow worker without a browser flow.
+
+### 10.5 Container dependency on MySQL
+
+All Airflow services depend on `mysql-dw` with
+`condition: service_healthy` (added to the `x-airflow-common` anchor).
+This ensures the workers do not start until MySQL passes its healthcheck
+(`mysqladmin ping`), preventing connection errors on cold starts.
+
+### 10.6 Runtime dependencies
+
+`airflow/requirements.txt` is mounted at `/requirements.txt` inside
+every container and installed on startup via
+`_PIP_ADDITIONAL_REQUIREMENTS`. It contains the same libraries as the
+local `requirements.txt`:
+
+```
+pandas, sqlalchemy, pymysql, python-dotenv,
+google-api-python-client, google-auth, google-auth-httplib2,
+google-auth-oauthlib
+```
+
+### 10.7 Running the DAG
+
+```bash
+# Start the full cluster (from the repo root)
+docker compose -f airflow/docker-compose.yaml --project-directory airflow up -d
+
+# Test the DAG end-to-end (runs inside the scheduler, no Celery)
+docker compose -f airflow/docker-compose.yaml --project-directory airflow \
+  exec airflow-scheduler airflow dags test etl_spotify_grammys 2026-04-10
+```
+
+Or trigger it from the Airflow web UI at `http://localhost:8080`
+(user `airflow` / password `airflow`).
+
+### 10.8 Validated results
+
+The DAG produces identical results to Phase A:
+
+| Table | Rows |
+|-------|------|
+| `fact_track` | 113 549 |
+| `dim_artist` | 17 639 |
+| `dim_album` | 57 657 |
+| `dim_genre` | 114 |
+| `dim_year` | 63 |
+
+---
+
+## 11. Assumptions and decisions
 
 - **Duplicate `track_id` values are kept**: the same track legitimately
   appears under multiple genres, and that drives the compound grain
@@ -513,9 +641,9 @@ GROUP BY a.artist_name ORDER BY avg_pop DESC LIMIT 10;
 
 - [x] **Phase A — Local pipeline**: extract, clean, merge, transform,
       load DW, upload to Drive, orchestrator. Validated end-to-end.
-- [ ] **Phase B — Airflow adaptation**: mount `src/` into the Airflow
-      containers, write the DAG that wraps each stage in a
-      `PythonOperator` and stages intermediate pickles in
-      `airflow/data/`.
+- [x] **Phase B — Airflow adaptation**: `src/` mounted read-only, DAG
+      with 7 tasks (TaskFlow API), pickle staging, credentials from env
+      vars, MySQL dependency in compose. Validated end-to-end with
+      identical results to Phase A.
 - [ ] **Phase C — Dashboard**: Looker Studio over MySQL via ngrok TCP,
       ≥3 KPIs and ≥3 charts combining both sources.
