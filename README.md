@@ -610,7 +610,64 @@ The DAG produces identical results to Phase A:
 
 ---
 
-## 11. Assumptions and decisions
+## 11. Phase C — Dashboard
+
+### 11.1 Exposing MySQL via ngrok
+
+The MySQL container is already port-forwarded to the host at
+`localhost:3307`. To make it reachable from Looker Studio:
+
+```bash
+ngrok tcp 3307
+```
+
+Ngrok prints a public address like `0.tcp.ngrok.io:12345`. Use those
+values in Looker Studio's MySQL connector:
+
+| Field    | Value                            |
+|----------|----------------------------------|
+| Host     | `0.tcp.ngrok.io` (before the `:`) |
+| Port     | `12345` (after the `:`)           |
+| Database | `grammys_dw`                     |
+| Username | value of `MYSQL_USER` in `.env`  |
+| Password | value of `MYSQL_PASSWORD` in `.env` |
+
+The ngrok address changes every time you restart the tunnel.
+Reconfigure the Looker data source if that happens.
+
+### 11.2 Dashboard queries
+
+All queries live in `sql/looker_queries.sql`. Each query is designed
+as a standalone Custom Query data source in Looker Studio.
+
+| # | Type | Query | Suggested visualization |
+|---|------|-------|------------------------|
+| 1 | KPI | General overview (totals + avg popularity) | Scorecard cards |
+| 2 | KPI | Top 10 artists by avg popularity | Bar chart or table |
+| 3 | KPI | Grammy winners vs non-winners comparison | Grouped bar or scorecards |
+| 4 | Chart | Avg audio features by genre (top 15) | Radar or grouped bar |
+| 5 | Chart | Popularity vs Grammy nominations per artist | Scatter plot |
+| 6 | Chart | Energy vs Valence by genre (mood quadrant) | Scatter plot |
+| 7 | Chart | Danceability vs Energy by Grammy status | Scatter (color = status) |
+| 8 | Chart | Top 10 genres by Grammy representation % | Horizontal bar |
+| 9 | Chart | Explicit vs Clean content comparison | Grouped bar or table |
+
+### 11.3 Key numbers from the warehouse
+
+| Metric | Value |
+|--------|-------|
+| Total tracks | 113 549 |
+| Unique artists | 17 639 |
+| Grammy-linked artists | 438 (2.5%) |
+| Genres | 114 |
+| Avg popularity (overall) | 33.3 |
+| Avg popularity (Grammy winners) | 32.6 |
+| Avg popularity (non-Grammy) | 33.4 |
+| Top genre by Grammy % | Rock (28.5%) |
+
+---
+
+## 12. Assumptions and decisions
 
 - **Duplicate `track_id` values are kept**: the same track legitimately
   appears under multiple genres, and that drives the compound grain
@@ -637,7 +694,7 @@ The DAG produces identical results to Phase A:
 
 ---
 
-## 11. Status
+## 13. Status
 
 - [x] **Phase A — Local pipeline**: extract, clean, merge, transform,
       load DW, upload to Drive, orchestrator. Validated end-to-end.
@@ -645,5 +702,5 @@ The DAG produces identical results to Phase A:
       with 7 tasks (TaskFlow API), pickle staging, credentials from env
       vars, MySQL dependency in compose. Validated end-to-end with
       identical results to Phase A.
-- [ ] **Phase C — Dashboard**: Looker Studio over MySQL via ngrok TCP,
-      ≥3 KPIs and ≥3 charts combining both sources.
+- [x] **Phase C — Dashboard**: queries in `sql/looker_queries.sql`,
+      ngrok TCP on port 3307, Looker Studio connected to `grammys_dw`.
