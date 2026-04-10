@@ -83,12 +83,16 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
     - ${AIRFLOW_PROJ_DIR:-.}/requirements:/opt/airflow/requirements
+    - ${AIRFLOW_PROJ_DIR:-.}/requirements.txt:/requirements.txt:ro
+    - ${AIRFLOW_PROJ_DIR:-.}/../src:/opt/airflow/src:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
     redis:
       condition: service_healthy
     postgres:
+      condition: service_healthy
+    mysql-dw:
       condition: service_healthy
 
 services:
