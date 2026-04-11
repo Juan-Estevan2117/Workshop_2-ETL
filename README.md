@@ -3,45 +3,15 @@
 End-to-end ETL pipeline that combines the Spotify tracks dataset with the
 Grammy Awards dataset, loads the result into a MySQL star-schema data
 warehouse, and publishes the merged CSV to Google Drive. The pipeline is
-implemented twice: first as a local Python orchestrator (Phase A — done),
-and later as an Airflow DAG that reuses the same modules (Phase B —
-pending).
-
-This README documents **Phase A only**. Phase B and the dashboard will be
-appended once they are implemented.
+implemented twice: first as a local Python orchestrator (Phase A), and
+then as an Airflow DAG that reuses the same modules (Phase B). A Looker
+Studio dashboard (Phase C) reads directly from the warehouse.
 
 ---
 
 ## 1. Architecture overview
 
-```
-                   ┌───────────────────────────┐
-                   │ spotify_dataset.csv       │
-                   │ (114k rows × 21 cols)     │
-                   └────────────┬──────────────┘
-                                │ extract_spotify_csv
-                                ▼
-                         ┌──────────────┐
-                         │ clean_spotify│
-                         └──────┬───────┘
-                                │
-┌────────────────┐              │                 ┌────────────────────┐
-│ grammys_src DB │              │                 │  merge_spotify_    │
-│ (MySQL, awards)│─extract──▶ clean_grammys ─────▶│  grammys           │
-└────────────────┘                                └──────────┬─────────┘
-                                                             │
-                                                             ▼
-                                                   ┌──────────────────┐
-                                                   │ build_star_schema│
-                                                   └──────┬───────────┘
-                                                          │
-                                      ┌───────────────────┴──────────┐
-                                      ▼                              ▼
-                             ┌─────────────────┐           ┌──────────────────┐
-                             │ load_star_schema│           │ upload_csv_to_   │
-                             │ → grammys_dw    │           │ drive (OAuth)    │
-                             └─────────────────┘           └──────────────────┘
-```
+![Pipeline architecture](figs/pipeline_architecture.svg)
 
 Both MySQL databases live in the **same** `mysql-dw` container but in
 **different schemas**:
@@ -86,7 +56,11 @@ etl-workshop_2/
 │   └── create_star_schema.sql    # DDL for the 5 star-schema tables
 ├── notebooks/
 │   └── data_profiling.ipynb      # initial exploration (not part of the pipeline)
-├── figs/                         # diagrams (referenced from this README)
+├── figs/
+│   ├── pipeline_architecture.png # end-to-end pipeline flow diagram
+│   ├── star_schema_eer.png       # EER from MySQL Workbench reverse engineering
+│   ├── airflow_dag_graph.png     # screenshot of the DAG graph view in Airflow UI
+│   └── looker_dashboard.png      # screenshot of the Looker Studio dashboard
 ├── requirements.txt              # local .venv deps (Phase A runtime)
 └── README.md
 ```
@@ -135,7 +109,7 @@ Python (`range(1, n+1)`) rather than via `AUTO_INCREMENT`, so the DDL is
 simple and the loader is idempotent (a `DELETE` + `INSERT` cycle inside
 a single transaction).
 
-![Star schema](figs/awards_and_star_schema.png)
+![Star schema EER diagram](figs/star_schema_eer.png)
 
 ### 4.1 Tables
 
@@ -513,11 +487,7 @@ are always in sync.
 
 ### 10.2 DAG structure
 
-```
-extract_spotify ──► clean_spotify_task ──┐
-                                         ├──► merge_task ──┬──► load_dw_task
-extract_grammys ──► clean_grammys_task ──┘                 └──► upload_drive_task
-```
+![Airflow DAG graph](figs/airflow_dag_graph.png)
 
 - **7 tasks**, each a `@task`-decorated function (TaskFlow API).
 - The two extractions run in **parallel**.
@@ -652,7 +622,11 @@ as a standalone Custom Query data source in Looker Studio.
 | 8 | Chart | Top 10 genres by Grammy representation % | Horizontal bar |
 | 9 | Chart | Explicit vs Clean content comparison | Grouped bar or table |
 
-### 11.3 Key numbers from the warehouse
+### 11.3 Dashboard
+
+![Looker Studio dashboard](figs/looker_dashboard.png)
+
+### 11.4 Key numbers from the warehouse
 
 | Metric | Value |
 |--------|-------|
@@ -694,7 +668,50 @@ as a standalone Custom Query data source in Looker Studio.
 
 ---
 
-## 13. Status
+## 13. Challenges encountered
+
+- **Hidden duplicates in Spotify CSV**: the `Unnamed: 0` column made
+  every row artificially unique, so `.duplicated()` in the initial
+  profiling returned zero. The ~450 true duplicates only surfaced after
+  dropping that column during extraction, causing a compound PK
+  violation in the fact table until `drop_duplicates()` was added to
+  the cleaning stage.
+
+- **Mixed timezones in Grammy datetimes**: the `published_at` column
+  mixed naive strings (`"2020-01-15"`) with tz-aware ones
+  (`"2020-01-15T00:00:00+00:00"`). A plain `pd.to_datetime()` raised
+  `ValueError: Mixed timezones detected`. Fixed by passing `utc=True`
+  to force a homogeneous tz-aware dtype.
+
+- **Empty strings vs NULL from MySQL `LOAD DATA INFILE`**: MySQL loaded
+  blank CSV fields as empty strings on text columns, not as `NULL`.
+  This caused downstream `.fillna()` calls to silently skip those
+  values. Fixed by adding `replace("", pd.NA)` on all text columns
+  before any other cleaning logic.
+
+- **`set -u` leaking from sourced init script**: the `init_dw.sh`
+  script originally used `set -euo pipefail`. Because the MySQL
+  entrypoint *sources* (not executes) `.sh` files, those shell options
+  persisted after the script returned and crashed the entrypoint at
+  line 331 (`$1` without a default under `set -u`). Fixed by removing
+  all `set` flags and documenting the gotcha.
+
+- **Service Account quota on Google Drive**: the initial implementation
+  used a GCP Service Account for the Drive upload. Service accounts
+  have no personal Drive storage quota, so the upload failed with
+  `storageQuotaExceeded`. Refactored to OAuth 2.0 user credentials
+  (`InstalledAppFlow`) so files are owned by the authorizing user.
+
+- **`requirements.txt` not mounted in Airflow containers**: the stock
+  `docker-compose.yaml` referenced `/requirements.txt` inside the
+  container via `_PIP_ADDITIONAL_REQUIREMENTS`, but no volume actually
+  mounted the file there. All containers silently failed the pip
+  install on every restart. Fixed by adding an explicit file-level
+  bind mount `./requirements.txt:/requirements.txt:ro`.
+
+---
+
+## 14. Status
 
 - [x] **Phase A — Local pipeline**: extract, clean, merge, transform,
       load DW, upload to Drive, orchestrator. Validated end-to-end.
